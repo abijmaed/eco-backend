@@ -1,0 +1,38 @@
+[
+  {
+    "id": "1756079280250",
+    "name": "Bomba de frenos",
+    "price": 500,
+    "description": "Bomba frenos",
+    "category": "articulos_usados",
+    "stock": 1,
+    "specs": {
+      "estado": "usado",
+      "marca": "gm",
+      "años_de_uso": "5"
+    },
+    "images": [
+      "bomba frenos.jpg"
+    ],
+    "createdAt": "2025-08-24T23:48:00.265Z",
+    "updatedAt": "2025-08-24T23:48:00.265Z"
+  },
+  {
+    "id": "1756079337799",
+    "name": "Modulo",
+    "price": 12000,
+    "description": "51 volts",
+    "category": "baterias",
+    "stock": 10,
+    "specs": {
+      "capacidad": "5kw",
+      "ciclos": "30000",
+      "garantia": "3 meses"
+    },
+    "images": [
+      "modulo.jpg"
+    ],
+    "createdAt": "2025-08-24T23:48:57.804Z",
+    "updatedAt": "2025-08-24T23:48:57.804Z"
+  }
+]
