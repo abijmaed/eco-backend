@@ -3,148 +3,259 @@ import fs from 'fs/promises';
 import path from 'path';
 import cors from 'cors';
 import { fileURLToPath } from 'url';
+import {
+  verifyPassword,
+  signToken,
+  verifyToken,
+  createLoginLimiter,
+} from './server-lib/adminAuth.js';
+import { sanitizeProduct } from './server-lib/productValidation.js';
 
 // Para tener __dirname en ES modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3001; // ✅ Usar variable de entorno
+const PORT = process.env.PORT || 3001;
 
-// Middleware
-app.use(cors({
-  origin: true, // Permitir todos los dominios
-  credentials: true
-}));
-app.use(express.json());
+// Railway entrega las peticiones a través de un proxy
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
 
-// Ruta del archivo de productos
-const productsFile = path.join(__dirname, 'api', 'products-data.json');
+// ---------------------------------------------------------------
+// CONFIGURACIÓN (variables de entorno en Railway)
+//   ADMIN_PASSWORD_HASH  -> hash de la contraseña del panel (ver scripts/)
+//   ADMIN_TOKEN_SECRET   -> clave para firmar las sesiones del panel
+//   ALLOWED_ORIGINS      -> (opcional) dominios extra permitidos, separados por comas
+//   DATA_DIR             -> (opcional) carpeta de un Volume de Railway para guardar productos
+// ---------------------------------------------------------------
+const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH;
+const ADMIN_TOKEN_SECRET = process.env.ADMIN_TOKEN_SECRET;
+const adminConfigured = Boolean(ADMIN_PASSWORD_HASH && ADMIN_TOKEN_SECRET);
 
-// FUNCIÓN PARA LEER PRODUCTOS
+const allowedOrigins = [
+  'https://www.electric-car-orchestra.com',
+  'https://electric-car-orchestra.com',
+  'http://localhost:3000',
+  'http://localhost:5173',
+  ...(process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean),
+];
+// Vista previa de Vercel (electric-car-orchestra-xxxx.vercel.app)
+const allowedOriginPattern = /^https:\/\/electric-car-orchestra[a-z0-9-]*\.vercel\.app$/;
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Sin "origin" = llamadas de servidor a servidor (por ejemplo el pago en Vercel)
+      const allowed =
+        !origin || allowedOrigins.includes(origin) || allowedOriginPattern.test(origin);
+      callback(null, allowed);
+    },
+  })
+);
+app.use(express.json({ limit: '100kb' }));
+
+// ---------------------------------------------------------------
+// ALMACÉN DE PRODUCTOS (archivo JSON)
+// ---------------------------------------------------------------
+const dataDir = process.env.DATA_DIR || path.join(__dirname, 'api');
+const productsFile = path.join(dataDir, 'products-data.json');
+const seedFile = path.join(__dirname, 'api', 'products-data.json');
+
+async function writeProducts(products) {
+  await fs.mkdir(dataDir, { recursive: true });
+  // Escritura segura: se escribe a un archivo temporal y luego se reemplaza
+  const tmpFile = `${productsFile}.${process.pid}.tmp`;
+  await fs.writeFile(tmpFile, JSON.stringify(products, null, 2));
+  await fs.rename(tmpFile, productsFile);
+}
+
 async function readProducts() {
   try {
-    const data = await fs.readFile(productsFile, 'utf8');
-    return JSON.parse(data);
+    return JSON.parse(await fs.readFile(productsFile, 'utf8'));
   } catch (error) {
-    // Si el archivo no existe, crearlo con array vacío
-    await fs.writeFile(productsFile, JSON.stringify([], null, 2));
-    return [];
+    if (error.code !== 'ENOENT') {
+      // Archivo dañado: no se sobrescribe con una lista vacía
+      throw error;
+    }
+    // Primer arranque: usar los productos incluidos en el proyecto, si existen
+    let initial = [];
+    try {
+      initial = JSON.parse(await fs.readFile(seedFile, 'utf8'));
+    } catch {
+      initial = [];
+    }
+    await writeProducts(initial);
+    return initial;
   }
 }
 
-// FUNCIÓN PARA GUARDAR PRODUCTOS
-async function saveProducts(products) {
-  await fs.writeFile(productsFile, JSON.stringify(products, null, 2));
+// Evita que dos cambios simultáneos se pisen entre sí
+let queue = Promise.resolve();
+function withLock(task) {
+  const run = queue.then(task);
+  queue = run.catch(() => {});
+  return run;
 }
 
-// 📦 RUTA: Obtener todos los productos (CON FILTROS)
+// ---------------------------------------------------------------
+// ADMINISTRACIÓN: inicio de sesión y protección de cambios
+// ---------------------------------------------------------------
+const loginLimiter = createLoginLimiter({ max: 5, windowMs: 15 * 60 * 1000 });
+
+function requireAdmin(req, res, next) {
+  if (!adminConfigured) {
+    return res.status(503).json({ error: 'La administración no está configurada en el servidor' });
+  }
+  const header = req.get('authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!verifyToken(token, ADMIN_TOKEN_SECRET)) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  next();
+}
+
+app.post('/api/admin/login', (req, res) => {
+  if (!adminConfigured) {
+    return res.status(503).json({ error: 'La administración no está configurada en el servidor' });
+  }
+
+  const key = req.ip;
+  if (loginLimiter.isBlocked(key)) {
+    return res.status(429).json({ error: 'Demasiados intentos. Inténtalo más tarde.' });
+  }
+
+  const password = req.body?.password;
+  if (!verifyPassword(password, ADMIN_PASSWORD_HASH)) {
+    loginLimiter.registerFailure(key);
+    return res.status(401).json({ error: 'Contraseña incorrecta' });
+  }
+
+  loginLimiter.reset(key);
+  res.json(signToken(ADMIN_TOKEN_SECRET));
+});
+
+// ---------------------------------------------------------------
+// RUTAS DE PRODUCTOS
+// ---------------------------------------------------------------
+
+// 📦 Obtener todos los productos (público)
 app.get('/api/products', async (req, res) => {
-  try {
-    const { category, search } = req.query;
-    let products = await readProducts();
+  const { category, search } = req.query;
+  let products = await readProducts();
 
-    // Filtrar por categoría si se especifica
-    if (category) {
-      products = products.filter(p => p.category === category);
-    }
-
-    // Buscar por término si se especifica
-    if (search) {
-      const term = search.toLowerCase();
-      products = products.filter(p =>
-        p.name.toLowerCase().includes(term) ||
-        (p.description && p.description.toLowerCase().includes(term))
-      );
-    }
-
-    res.json(products);
-  } catch (error) {
-    res.status(500).json({ error: 'Error al leer productos' });
+  if (category) {
+    products = products.filter((p) => p.category === category);
   }
+
+  if (search) {
+    const term = String(search).toLowerCase();
+    products = products.filter(
+      (p) =>
+        String(p.name).toLowerCase().includes(term) ||
+        (p.description && String(p.description).toLowerCase().includes(term))
+    );
+  }
+
+  res.json(products);
 });
 
-// ➕ RUTA: Crear nuevo producto
-app.post('/api/products', async (req, res) => {
-  try {
+// 🔍 Buscar productos (público)
+app.get('/api/products/search', async (req, res) => {
+  const { q } = req.query;
+  const products = await readProducts();
+
+  if (!q) {
+    return res.json(products);
+  }
+
+  const term = String(q).toLowerCase();
+  res.json(
+    products.filter(
+      (p) =>
+        String(p.name).toLowerCase().includes(term) ||
+        (p.description && String(p.description).toLowerCase().includes(term))
+    )
+  );
+});
+
+// ➕ Crear producto (solo administrador)
+app.post('/api/products', requireAdmin, async (req, res) => {
+  const result = sanitizeProduct(req.body);
+  if (!result.ok) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  const newProduct = await withLock(async () => {
     const products = await readProducts();
-    const newProduct = {
-      id: Date.now().toString(),
-      ...req.body,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
+    const now = new Date().toISOString();
+    // Identificador único (evita repetir el mismo número si dos productos se crean al mismo tiempo)
+    let id = Date.now();
+    while (products.some((p) => String(p.id) === String(id))) id += 1;
+    const product = {
+      id: String(id),
+      description: '',
+      category: 'uncategorized',
+      stock: 0,
+      specs: {},
+      images: [],
+      ...result.value,
+      createdAt: now,
+      updatedAt: now,
     };
+    products.push(product);
+    await writeProducts(products);
+    return product;
+  });
 
-    products.push(newProduct);
-    await saveProducts(products);
-
-    res.status(201).json(newProduct);
-  } catch (error) {
-    res.status(500).json({ error: 'Error al crear producto' });
-  }
+  res.status(201).json(newProduct);
 });
 
-// ✏️ RUTA: Actualizar producto
-app.put('/api/products/:id', async (req, res) => {
-  try {
-    const products = await readProducts();
-    const index = products.findIndex(p => p.id === req.params.id);
+// ✏️ Actualizar producto (solo administrador)
+app.put('/api/products/:id', requireAdmin, async (req, res) => {
+  const result = sanitizeProduct(req.body, { partial: true });
+  if (!result.ok) {
+    return res.status(400).json({ error: result.error });
+  }
 
-    if (index === -1) {
-      return res.status(404).json({ error: 'Producto no encontrado' });
-    }
+  const updated = await withLock(async () => {
+    const products = await readProducts();
+    const index = products.findIndex((p) => p.id === req.params.id);
+    if (index === -1) return null;
 
     products[index] = {
       ...products[index],
-      ...req.body,
-      updatedAt: new Date().toISOString()
+      ...result.value,
+      id: products[index].id,
+      updatedAt: new Date().toISOString(),
     };
+    await writeProducts(products);
+    return products[index];
+  });
 
-    await saveProducts(products);
-    res.json(products[index]);
-  } catch (error) {
-    res.status(500).json({ error: 'Error al actualizar producto' });
+  if (!updated) {
+    return res.status(404).json({ error: 'Producto no encontrado' });
   }
+  res.json(updated);
 });
 
-// 🗑️ RUTA: Eliminar producto
-app.delete('/api/products/:id', async (req, res) => {
-  try {
-    let products = await readProducts();
-    const initialLength = products.length;
-    
-    products = products.filter(p => p.id !== req.params.id);
-    
-    if (products.length === initialLength) {
-      return res.status(404).json({ error: 'Producto no encontrado' });
-    }
-
-    await saveProducts(products);
-    res.json({ message: 'Producto eliminado' });
-  } catch (error) {
-    res.status(500).json({ error: 'Error al eliminar producto' });
-  }
-});
-
-// 🔍 RUTA: Buscar productos (endpoint específico)
-app.get('/api/products/search', async (req, res) => {
-  try {
-    const { q } = req.query;
+// 🗑️ Eliminar producto (solo administrador)
+app.delete('/api/products/:id', requireAdmin, async (req, res) => {
+  const removed = await withLock(async () => {
     const products = await readProducts();
-    
-    if (!q) {
-      return res.json(products);
-    }
+    const remaining = products.filter((p) => p.id !== req.params.id);
+    if (remaining.length === products.length) return false;
+    await writeProducts(remaining);
+    return true;
+  });
 
-    const filteredProducts = products.filter(product =>
-      product.name.toLowerCase().includes(q.toLowerCase()) ||
-      (product.description && product.description.toLowerCase().includes(q.toLowerCase()))
-    );
-
-    res.json(filteredProducts);
-  } catch (error) {
-    res.status(500).json({ error: 'Error al buscar productos' });
+  if (!removed) {
+    return res.status(404).json({ error: 'Producto no encontrado' });
   }
+  res.json({ message: 'Producto eliminado' });
 });
 
 // 🏠 Ruta de prueba
@@ -152,13 +263,25 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', message: 'ECO API funcionando' });
 });
 
+// Manejo de errores (sin mostrar detalles internos)
+app.use((err, req, res, next) => {
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'JSON inválido' });
+  }
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Datos demasiado grandes' });
+  }
+  console.error('Error en la API:', err.message);
+  res.status(500).json({ error: 'Error interno del servidor' });
+});
+
 // 🚀 Iniciar servidor
 app.listen(PORT, () => {
   console.log(`🚀 API Server running on port ${PORT}`);
-  console.log(`📦 GET: http://localhost:${PORT}/api/products`);
-  console.log(`➕ POST: http://localhost:${PORT}/api/products`);
-  console.log(`✏️ PUT: http://localhost:${PORT}/api/products/:id`);
-  console.log(`🗑️ DELETE: http://localhost:${PORT}/api/products/:id`);
-  console.log(`🔍 SEARCH: http://localhost:${PORT}/api/products/search?q=texto`);
-  console.log(`🏠 HEALTH: http://localhost:${PORT}/api/health`);
+  if (!adminConfigured) {
+    console.warn(
+      '⚠️ ADMIN_PASSWORD_HASH y ADMIN_TOKEN_SECRET no están configuradas: ' +
+        'las operaciones de administración están bloqueadas.'
+    );
+  }
 });
